@@ -1,0 +1,548 @@
+import { NextRequest, NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const BASE =
+  "https://foxxynime.my.id/api/miku/v21/proxy/yanz";
+
+const COMIC_BASE =
+  "https://foxxynime.my.id/api/miku/v21/proxy/yanz/api/komikindo";
+
+const BLOCKED = [
+  "hentai", "porn", "nsfw", "18+", "adult",
+  "mature", "ecchi", "erotic", "smut", "xxx",
+];
+
+function safeText(value: unknown) {
+  return String(value ?? "").toLowerCase();
+}
+
+function isSafe(item: any) {
+  const genres = Array.isArray(item?.genres)
+    ? item.genres.join(" ")
+    : Array.isArray(item?.genre)
+      ? item.genre.join(" ")
+      : item?.genre ?? "";
+
+  const text = [
+    item?.title,
+    item?.name,
+    item?.synopsis,
+    item?.sinopsis,
+    genres,
+    item?.type,
+  ].map(safeText).join(" ");
+
+  return !BLOCKED.some((word) => text.includes(word));
+}
+
+async function upstream(path: string) {
+  const response = await fetch(`${BASE}${path}`, {
+    headers: {
+      Accept: "application/json",
+      Origin: "https://foxxynime.my.id",
+      Referer: "https://foxxynime.my.id/",
+    },
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error(`API FoxxyNime HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function comicUpstream(path: string) {
+  const response = await fetch(
+    `${COMIC_BASE}${path.startsWith("/") ? path : `/${path}`}`,
+    {
+      headers: {
+        Accept: "application/json",
+        Origin: "https://foxxynime.my.id",
+        Referer: "https://foxxynime.my.id/",
+      },
+      cache: "no-store",
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`API KomikIndo HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function listOf(value: any): any[] {
+  if (Array.isArray(value)) return value;
+
+  const candidates = [
+    value?.data,
+    value?.result,
+    value?.movie,
+    value?.episode,
+    value?.data?.movie,
+    value?.data?.episode,
+    value?.result?.movie,
+    value?.result?.episode,
+  ];
+
+  return candidates.find(Array.isArray) ?? [];
+}
+
+function comicSlug(value: string) {
+  const slug = value.trim().replace(/^\/+|\/+$/g, "");
+
+  if (!/^[a-z0-9-]+$/i.test(slug)) {
+    throw new Error("Slug komik tidak valid.");
+  }
+
+  return slug;
+}
+
+function animeId(value: string) {
+  if (!/^\d+$/.test(value)) {
+    throw new Error("ID anime tidak valid.");
+  }
+
+  return value;
+}
+
+function httpsUrl(value: unknown) {
+  if (typeof value !== "string") return "";
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" ? url.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+// Gambar anime melewati proxy gambar API utama.
+function animeImage(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return "";
+
+  try {
+    const source = new URL(
+      value.trim(),
+      "https://api.animein.net"
+    );
+
+    const host = source.hostname.toLowerCase();
+
+    if (
+      source.protocol !== "https:" ||
+      !(host === "animein.net" || host.endsWith(".animein.net"))
+    ) {
+      return "";
+    }
+
+    return `${BASE}/proxy-image?url=${encodeURIComponent(
+      source.toString()
+    )}`;
+  } catch {
+    return "";
+  }
+}
+
+function getServerUrl(server: any) {
+  // Prioritaskan URL proxy dari API utama.
+  const keys = [
+    "proxy_link",
+    "link",
+    "original_link",
+    "raw_link",
+    "url",
+    "src",
+    "file",
+    "video_url",
+    "stream_url",
+    "direct_url",
+    "hls",
+  ];
+
+  for (const key of keys) {
+    const result = httpsUrl(server?.[key]);
+    if (result) return result;
+  }
+
+  return "";
+}
+
+async function searchAnime(query: string) {
+  const result = await upstream(
+    `/search?q=${encodeURIComponent(query)}`
+  );
+
+  return listOf(result)
+    .filter((item) => item?.id && isSafe(item))
+    .map((item) => ({
+      title: String(item.title || "Tanpa judul"),
+      url: String(item.id),
+      thumbnail: animeImage(
+        item.image_poster || item.image_cover
+      ),
+      meta: [
+        item.type,
+        item.year,
+        item.status,
+      ].filter(Boolean).join(" • "),
+    }));
+}
+
+async function searchComic(query: string) {
+  const result = await comicUpstream(
+    `/search?q=${encodeURIComponent(query)}`
+  );
+
+  const candidates = listOf(result).filter(
+    (item) => item?.slug && isSafe(item)
+  );
+
+  const checked = await Promise.all(
+    candidates.slice(0, 20).map(async (item) => {
+      try {
+        const detail = await comicUpstream(
+          `/detail/${comicSlug(String(item.slug))}`
+        );
+        const data = detail?.data ?? detail;
+        if (!isSafe(data)) return null;
+        return item;
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  return checked.filter(Boolean).map((item: any) => ({
+    title: String(item.title || "Tanpa judul"),
+    url: comicSlug(String(item.slug)),
+    thumbnail: httpsUrl(item.thumb),
+    meta: [item.type, item.status, item.score ? `Skor ${item.score}` : ""]
+      .filter(Boolean)
+      .join(" • "),
+  }));
+}
+
+// Ambil daftar episode berdasarkan ID MOVIE, bukan ID episode group.
+async function getAnimeEpisodes(id: string) {
+  const detail = await upstream(
+    `/detail/${animeId(id)}`
+  );
+
+  const movie = detail?.movie ?? detail?.data?.movie;
+
+  if (!movie?.id || !isSafe(movie)) {
+    throw new Error("Konten ini tidak tersedia.");
+  }
+
+  const movieId = animeId(String(movie.id));
+
+  // all=true mengambil seluruh halaman episode dari scraper utama.
+  const result = await upstream(
+    `/episode/${movieId}?all=true`
+  );
+
+  return listOf(result)
+    .filter(
+      (item) =>
+        item?.id &&
+        (
+          !item.id_movie ||
+          String(item.id_movie) === movieId
+        )
+    )
+    .map((item) => ({
+      title: String(
+        item.title || `Episode ${item.index || ""}`
+      ),
+      url: String(item.id),
+    }));
+}
+
+async function getComicChapters(slug: string) {
+  const detail = await comicUpstream(
+    `/detail/${comicSlug(slug)}`
+  );
+
+  const data = detail?.data ?? detail;
+
+  if (!isSafe(data)) {
+    throw new Error("Komik ini tidak tersedia.");
+  }
+
+  const chapters = Array.isArray(data?.chapters)
+    ? data.chapters
+    : [];
+
+  return chapters.flatMap((chapter: any) => {
+    try {
+      let slug = "";
+
+      if (typeof chapter.slug === "string") {
+        slug = comicSlug(chapter.slug);
+      } else if (typeof chapter.link === "string") {
+        const link = new URL(chapter.link);
+
+        if (
+          link.protocol !== "https:" ||
+          !["komikindo.ch", "www.komikindo.ch"].includes(link.hostname)
+        ) {
+          return [];
+        }
+
+        slug = comicSlug(
+          link.pathname.split("/").filter(Boolean).pop() || ""
+        );
+      }
+
+      if (!slug) return [];
+
+      return [{
+        title: String(chapter.name || "Chapter"),
+        url: slug,
+      }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+async function getComicImages(slug: string) {
+  const result = await comicUpstream(
+    `/chapter/${comicSlug(slug)}`
+  );
+
+  const data = result?.data ?? result;
+  const images = Array.isArray(data?.images) ? data.images : [];
+
+  return {
+    downloads: images
+      .map((image: any) => ({
+        type: "photo",
+        url: httpsUrl(
+          typeof image === "string"
+            ? image
+            : image?.url || image?.src || image?.image
+        ),
+      }))
+      .filter((item: any) => item.url),
+  };
+}
+
+// ID yang diterima adalah ID EPISODE, bukan ID movie.
+async function getAnimeStream(id: string) {
+  const result = await upstream(
+    `/stream/${animeId(id)}`
+  );
+
+  const servers = Array.isArray(result?.server)
+    ? result.server
+    : Array.isArray(result?.data?.server)
+      ? result.data.server
+      : [];
+
+  const downloads = servers.flatMap((server: any) => {
+    const url = getServerUrl(server);
+
+    if (!url) return [];
+
+    return [{
+      type: server.type === "direct" ? "video" : "link",
+      quality: String(
+        server.quality || server.name || "Server"
+      ),
+      url,
+    }];
+  });
+
+  return { downloads };
+}
+
+
+function mapHomeItem(item: any) {
+  if (!item?.id || !isSafe(item)) return null;
+
+  return {
+    title: String(item.title || item.name || "Tanpa judul"),
+    url: String(item.id),
+    thumbnail: animeImage(item.image_poster || item.image_cover),
+    meta: [
+      item.year,
+      item.status,
+      item.day,
+      item.type,
+      item.genre,
+    ].filter(Boolean).join(" • "),
+    views: String(item.views || "0"),
+    favorites: String(item.favorites || "0"),
+    day: String(item.day || ""),
+    status: String(item.status || ""),
+    genre: String(item.genre || ""),
+  };
+}
+
+async function getAnimeHome() {
+  const [home, schedule] = await Promise.all([
+    upstream("/home"),
+    upstream("/schedule"),
+  ]);
+
+  const mapList = (value: any) =>
+    (Array.isArray(value) ? value : [])
+      .map(mapHomeItem)
+      .filter(Boolean);
+
+  const days = [
+    "SENIN", "SELASA", "RABU", "KAMIS",
+    "JUMAT", "SABTU", "MINGGU",
+  ];
+
+  const weeklySchedule = days.map((day) => ({
+    day,
+    items: mapList(schedule?.[day]),
+  }));
+
+  return {
+    hot: mapList(home?.hot),
+    new_added: mapList(home?.new_added),
+    popular: mapList(home?.popular),
+    waiting: mapList(home?.waiting),
+    just_for_you: mapList(home?.just_for_you),
+    schedule: weeklySchedule,
+  };
+}
+
+function mapComicItem(item: any) {
+  if (!item?.slug || !isSafe(item)) return null;
+
+  let slug: string;
+  try {
+    slug = comicSlug(String(item.slug));
+  } catch {
+    return null;
+  }
+
+  return {
+    title: String(item.title || "Tanpa judul"),
+    url: slug,
+    thumbnail: httpsUrl(item.thumb),
+    meta: [
+      item.type,
+      item.status,
+      item.score ? `Skor ${item.score}` : "",
+    ].filter(Boolean).join(" • "),
+    status: String(item.status || ""),
+    genre: Array.isArray(item.genres)
+      ? item.genres.join(", ")
+      : String(item.genre || ""),
+  };
+}
+
+async function getComicHome() {
+  const result = await comicUpstream("/home");
+  const data = result?.data ?? result;
+
+  const mapList = (items: any[]) =>
+    (Array.isArray(items) ? items : [])
+      .map(mapComicItem)
+      .filter(Boolean);
+
+  return {
+    slider: mapList(data?.slider),
+    popularToday: mapList(data?.popularToday),
+    projectUpdate: mapList(data?.projectUpdate),
+    latestUpdate: mapList(data?.latestUpdate),
+    coloredUpdate: mapList(data?.coloredUpdate),
+    popularManga: mapList(data?.popularManga),
+    latestCollection: mapList(data?.latestCollection),
+  };
+}
+
+async function getComicGenres() {
+  const result = await comicUpstream("/genres");
+  const items = Array.isArray(result?.data) ? result.data : [];
+
+  return items.filter((item: any) => {
+    const name = safeText(item?.name);
+    const slug = safeText(item?.slug);
+    return item?.slug &&
+      !BLOCKED.some((word) => name.includes(word) || slug.includes(word));
+  }).map((item: any) => ({
+    name: String(item.name || ""),
+    slug: String(item.slug || ""),
+  }));
+}
+
+export async function GET(request: NextRequest) {
+  try {
+    const params = request.nextUrl.searchParams;
+
+    const type = params.get("type");
+    const action = params.get("action");
+    const query = (params.get("q") || "").trim();
+    const url = (params.get("url") || "").trim();
+
+    if (!["anime", "comic"].includes(type || "")) {
+      throw new Error("Tipe konten tidak valid.");
+    }
+
+    let data: any;
+
+    if (action === "home" && type === "anime") {
+      data = await getAnimeHome();
+
+    } else if (action === "home" && type === "comic") {
+      data = await getComicHome();
+
+    } else if (action === "genres" && type === "comic") {
+      data = await getComicGenres();
+
+    } else if (action === "search") {
+      if (!query) {
+        throw new Error("Kata pencarian masih kosong.");
+      }
+
+      data = type === "anime"
+        ? await searchAnime(query)
+        : await searchComic(query);
+
+    } else if (action === "episodes" && type === "anime") {
+      data = await getAnimeEpisodes(url);
+
+    } else if (action === "chapters" && type === "comic") {
+      data = await getComicChapters(url);
+
+    } else if (action === "scrape" && type === "anime") {
+      data = await getAnimeStream(url);
+
+    } else if (action === "scrape" && type === "comic") {
+      data = await getComicImages(url);
+
+    } else {
+      throw new Error("Aksi API tidak dikenal.");
+    }
+
+    return NextResponse.json(
+      { ok: true, type, action, data },
+      {
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      }
+    );
+
+  } catch (error) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: error instanceof Error
+          ? error.message
+          : "Terjadi kesalahan.",
+      },
+      { status: 400 }
+    );
+  }
+}

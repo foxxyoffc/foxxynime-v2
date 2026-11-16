@@ -1,0 +1,412 @@
+"use client";
+
+import { Suspense, useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  ArrowLeft,
+  BookOpen,
+  Film,
+  Loader2,
+  AlertCircle,
+  ExternalLink,
+  Play,
+} from "lucide-react";
+import Hls from "hls.js";
+
+type MediaFile = {
+  type?: string;
+  quality?: string;
+  url?: string;
+  headers?: Record<string, string>;
+};
+
+function isHttpsUrl(value?: string) {
+  try {
+    return !!value && new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isHlsUrl(value?: string) {
+  try {
+    return !!value && new URL(value).pathname.toLowerCase().endsWith(".m3u8");
+  } catch {
+    return false;
+  }
+}
+
+function isDirectVideo(file: MediaFile) {
+  if (!isHttpsUrl(file.url)) return false;
+  const path = new URL(file.url!).pathname.toLowerCase();
+
+  return file.type === "video" ||
+    /\.(mp4|webm|ogg|mov|m4v)$/.test(path);
+}
+
+function isWebPlayer(file: MediaFile) {
+  return file.type === "link" &&
+    isHttpsUrl(file.url) &&
+    !isHlsUrl(file.url) &&
+    !isDirectVideo(file);
+}
+
+function isAllowedEmbed(value: string) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" &&
+      url.hostname === "desustream.net" &&
+      url.pathname.startsWith("/dstream/");
+  } catch {
+    return false;
+  }
+}
+
+function ViewerContent() {
+  const router = useRouter();
+  const params = useSearchParams();
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  const type = params.get("type") === "comic" ? "comic" : "anime";
+  const provider = params.get("provider") || "";
+  const title = params.get("title") || "Konten";
+  const entryTitle = params.get("entryTitle") || "Bagian";
+  const sourceUrl = params.get("url") || "";
+
+  const [files, setFiles] = useState<MediaFile[]>([]);
+  const [embedUrl, setEmbedUrl] = useState("");
+  const [showEmbed, setShowEmbed] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [playbackError, setPlaybackError] = useState("");
+  const [selected, setSelected] = useState(0);
+
+  const isAnime = type === "anime";
+  const Icon = isAnime ? Film : BookOpen;
+
+  useEffect(() => {
+    let active = true;
+
+    async function loadMedia() {
+      if (!sourceUrl || !provider) {
+        setError("Alamat konten tidak tersedia.");
+        setLoading(false);
+        return;
+      }
+
+      try {
+        const query = new URLSearchParams({
+          type,
+          provider,
+          action: "scrape",
+          url: sourceUrl,
+        });
+
+        const response = await fetch(`/api/scraper?${query}`);
+        const json = await response.json();
+
+        if (!response.ok || !json.ok) {
+          throw new Error(json.error || "Konten gagal dimuat.");
+        }
+
+        const data = json.data;
+
+        const downloads: MediaFile[] = Array.isArray(data?.downloads)
+          ? data.downloads
+          : Array.isArray(data?.images)
+            ? data.images.map((url: string) => ({
+                type: "photo",
+                url,
+              }))
+            : [];
+
+        const usable = downloads.filter((item) => {
+          if (!item || !isHttpsUrl(item.url)) return false;
+          if (type === "comic") return item.type === "photo";
+
+          return isDirectVideo(item) ||
+            isHlsUrl(item.url) ||
+            isWebPlayer(item);
+        });
+
+        const candidateEmbed =
+          typeof data?.embedUrl === "string" ? data.embedUrl : "";
+
+        const safeEmbed = isAllowedEmbed(candidateEmbed)
+          ? candidateEmbed
+          : "";
+
+        if (!usable.length && !(type === "anime" && safeEmbed)) {
+          throw new Error(
+            type === "anime"
+              ? "Provider tidak mengembalikan sumber video atau Web Player."
+              : "Provider tidak menyediakan gambar chapter."
+          );
+        }
+
+        if (active) {
+          setFiles(usable);
+          setSelected(0);
+          setEmbedUrl(safeEmbed);
+          setShowEmbed(false);
+          setPlaybackError("");
+        }
+      } catch (err) {
+        if (active) {
+          setError(
+            err instanceof Error ? err.message : "Gagal memuat media."
+          );
+        }
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    loadMedia();
+    return () => {
+      active = false;
+    };
+  }, [type, provider, sourceUrl]);
+
+  const selectedFile = files[selected];
+  const selectedIsHls = isHlsUrl(selectedFile?.url);
+  const selectedIsDirect = selectedFile
+    ? isDirectVideo(selectedFile)
+    : false;
+  const selectedIsWebPlayer = selectedFile
+    ? isWebPlayer(selectedFile)
+    : false;
+
+  useEffect(() => {
+    const video = videoRef.current;
+
+    if (!video || !selectedFile?.url || !isAnime || showEmbed) return;
+
+    setPlaybackError("");
+
+    if (selectedIsWebPlayer) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      return;
+    }
+
+    if (!selectedIsHls) return;
+
+    if (Hls.isSupported()) {
+      const hls = new Hls();
+      hls.loadSource(selectedFile.url);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        console.error("[FoxxyNime HLS]", {
+          type: data.type,
+          details: data.details,
+          fatal: data.fatal,
+          status: data.response?.code,
+        });
+
+        if (data.fatal) {
+          const status = data.response?.code;
+          const detail = data.details || data.type || "unknown";
+
+          setPlaybackError(
+            `HLS tidak dapat diputar: ${detail}` +
+            (status ? ` | HTTP ${status}` : "") +
+            ". Coba sumber Web Player jika tersedia."
+          );
+
+          hls.destroy();
+        }
+      });
+
+      return () => hls.destroy();
+    }
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = selectedFile.url;
+      video.load();
+      return;
+    }
+
+    setPlaybackError("Browser ini tidak mendukung pemutaran HLS.");
+  }, [
+    selectedFile?.url,
+    selectedIsHls,
+    selectedIsWebPlayer,
+    isAnime,
+    showEmbed,
+  ]);
+
+  return (
+    <div className="app-shell">
+      <header className="simple-header">
+        <button
+          className="icon-button"
+          onClick={() => router.back()}
+          aria-label="Kembali"
+        >
+          <ArrowLeft size={20} />
+        </button>
+
+        <div className="detail-header-label">
+          FOXXYNIME <span>{isAnime ? "PLAYER" : "READER"}</span>
+        </div>
+
+        <span className="detail-header-spacer" />
+      </header>
+
+      <main className="simple-main viewer-main">
+        <div className="viewer-heading">
+          <span className="detail-type">
+            {isAnime ? "NOW PLAYING" : "NOW READING"}
+          </span>
+          <h1>{title}</h1>
+          <p>{entryTitle}</p>
+        </div>
+
+        {loading ? (
+          <div className="catalog-status">
+            <Loader2 className="spin" size={24} />
+            Mengambil media...
+          </div>
+        ) : error ? (
+          <div className="viewer-error">
+            <AlertCircle size={24} />
+            <p>{error}</p>
+            <small>
+              Pastikan sumber dapat diakses dan memiliki izin distribusi.
+            </small>
+          </div>
+        ) : isAnime ? (
+          <section className="viewer-player">
+            {showEmbed && embedUrl ? (
+              <iframe
+                key={embedUrl}
+                src={embedUrl}
+                title={`${entryTitle} - Player`}
+                allow="autoplay; fullscreen; picture-in-picture"
+                allowFullScreen
+                referrerPolicy="strict-origin-when-cross-origin"
+              />
+            ) : selectedIsWebPlayer ? (
+              <div className="viewer-error">
+                <ExternalLink size={28} />
+                <p>{selectedFile?.quality || "Web Player tersedia"}</p>
+                <small>
+                  Sumber ini merupakan halaman player provider.
+                  Buka melalui browser untuk mencobanya.
+                </small>
+
+                <button
+                  className="viewer-open-source"
+                  onClick={() => {
+                    if (selectedFile?.url) {
+                      window.open(
+                        selectedFile.url,
+                        "_blank",
+                        "noopener,noreferrer"
+                      );
+                    }
+                  }}
+                >
+                  <Play size={17} />
+                  Buka Web Player
+                  <ExternalLink size={15} />
+                </button>
+              </div>
+            ) : selectedIsDirect || selectedIsHls ? (
+              <video
+                ref={videoRef}
+                key={selectedFile?.url}
+                controls
+                playsInline
+                preload="metadata"
+                src={selectedIsHls ? undefined : selectedFile?.url}
+              />
+            ) : embedUrl ? (
+              <div className="viewer-error">
+                <p>Player embed resmi tersedia.</p>
+                <button
+                  className="viewer-open-source"
+                  onClick={() => setShowEmbed(true)}
+                >
+                  Gunakan Embed Provider
+                </button>
+              </div>
+            ) : (
+              <div className="viewer-error">
+                <AlertCircle size={22} />
+                <p>Tidak ada sumber yang bisa ditampilkan.</p>
+              </div>
+            )}
+
+            {playbackError && (
+              <div className="viewer-error">
+                <AlertCircle size={20} />
+                <p>{playbackError}</p>
+              </div>
+            )}
+
+            <div className="viewer-source-note">
+              <Icon size={15} /> Sumber: {provider}
+            </div>
+
+            {files.length > 0 && (
+              <div className="viewer-quality-list">
+                {files.map((file, index) => (
+                  <button
+                    key={`${file.url}-${index}`}
+                    className={
+                      !showEmbed && selected === index ? "active" : ""
+                    }
+                    onClick={() => {
+                      setShowEmbed(false);
+                      setSelected(index);
+                      setPlaybackError("");
+                    }}
+                  >
+                    {file.quality || `Sumber ${index + 1}`}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {embedUrl && (
+              <button
+                className="viewer-open-source"
+                onClick={() => {
+                  setShowEmbed(true);
+                  setPlaybackError("");
+                }}
+              >
+                Gunakan Embed Provider
+              </button>
+            )}
+          </section>
+        ) : (
+          <section className="reader-pages">
+            {files.map((file, index) => (
+              <img
+                key={`${file.url}-${index}`}
+                src={file.url}
+                alt={`${entryTitle} halaman ${index + 1}`}
+                loading={index < 2 ? "eager" : "lazy"}
+              />
+            ))}
+          </section>
+        )}
+      </main>
+    </div>
+  );
+}
+
+export default function ViewerPage() {
+  return (
+    <Suspense
+      fallback={<div className="catalog-status">Memuat player...</div>}
+    >
+      <ViewerContent />
+    </Suspense>
+  );
+}
